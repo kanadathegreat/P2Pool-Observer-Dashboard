@@ -2,8 +2,16 @@
 main_window.py
 ----------------
 The real dashboard window. Same visual shell as GUI Test's main.py,
-now wired to actual live data via api_client.py, with a working
-300-second auto-refresh and 30-second manual cooldown.
+wired to live data two ways now:
+  - ONE full REST fetch at startup (and again if the user clicks
+    Refresh Now), via refresh_data() / p2pool_state.bootstrap().
+  - Everything after that arrives over the WebSocket event stream
+    (event_listener.py) and updates p2pool_state.py's local shadow
+    of the P2Pool window -- no more periodic REST polling for P2Pool
+    data specifically.
+The one thing still on a timer is the XMR price converter, since
+that's a separate API (CoinGecko) with no push/event mechanism at
+all -- see PRICE_REFRESH_SECONDS below.
 """
 
 import os
@@ -26,12 +34,16 @@ from api_client import (
     Network, P2PoolClient, P2PoolAPIError,
     calculate_hashrate, format_hashrate, seconds_to_friendly_duration,
 )
+from event_listener import P2PoolEventListener
+from p2pool_state import P2PoolLiveState
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 LOGO_PATH = os.path.join(SCRIPT_DIR, "assets", "logo.jpeg")
 
 REFRESH_COOLDOWN_SECONDS = 30
-AUTO_REFRESH_SECONDS = 300
+# Only governs the XMR price converter now -- P2Pool's own numbers no
+# longer refresh on a timer at all, they update live from events.
+PRICE_REFRESH_SECONDS = 300
 
 _NETWORK_LABELS = {Network.NORMAL: "Normal", Network.MINI: "Mini", Network.NANO: "Nano"}
 
@@ -105,6 +117,7 @@ class MainWindow(QMainWindow):
         self.wallet_address = wallet_address
         self.config = config
         self.client = P2PoolClient(network, debug_dir="cache/debug")
+        self.live_state = P2PoolLiveState(wallet_address)
 
         self.setWindowTitle(f"P2Pool Observer Dashboard — {_NETWORK_LABELS[network]}")
         self.resize(1600, 900)
@@ -127,11 +140,11 @@ class MainWindow(QMainWindow):
 
         # -- Timers --------------------------------------------------
         # One 1-second timer drives BOTH visible countdowns (manual
-        # cooldown + next auto-refresh), since they're both just "a
+        # cooldown + next price refresh), since they're both just "a
         # number that ticks down once a second." A separate timer per
         # countdown would do the same job with more moving parts.
         self._cooldown_seconds_left = 0
-        self._seconds_until_auto_refresh = AUTO_REFRESH_SECONDS
+        self._seconds_until_price_refresh = PRICE_REFRESH_SECONDS
         # Set once per refresh from found_blocks (the actual Monero
         # blocks P2Pool has found) -- NOT from the sidechain's own
         # block churn, which happens every few seconds and would make
@@ -154,6 +167,16 @@ class MainWindow(QMainWindow):
         self._tick_timer.setInterval(1000)
         self._tick_timer.timeout.connect(self._on_tick)
         self._tick_timer.start()
+
+        # -- Live event listener -------------------------------------
+        # Runs on its own background thread (see event_listener.py's
+        # docstring for why). new_event.connect() below is what makes
+        # _on_p2pool_event() get called safely on OUR thread (the
+        # main/GUI thread) every time the background thread emits,
+        # even though the two run independently.
+        self.event_listener = P2PoolEventListener(network)
+        self.event_listener.new_event.connect(self._on_p2pool_event)
+        self.event_listener.start()
 
         # Kick off the very first data load immediately, rather than
         # waiting 300 seconds for the first numbers to appear.
@@ -405,13 +428,12 @@ class MainWindow(QMainWindow):
             age = time.time() - found_at
             self.payout_table.setItem(row, 1, QTableWidgetItem(seconds_to_friendly_duration(age)))
 
-        self._seconds_until_auto_refresh -= 1
-        if self._seconds_until_auto_refresh <= 0:
-            self._seconds_until_auto_refresh = AUTO_REFRESH_SECONDS
-            self.refresh_data()
-            self._engage_cooldown()
-        minutes, seconds = divmod(self._seconds_until_auto_refresh, 60)
-        self.next_refresh_label.setText(f"Next auto-refresh: {minutes}:{seconds:02d}")
+        self._seconds_until_price_refresh -= 1
+        if self._seconds_until_price_refresh <= 0:
+            self._seconds_until_price_refresh = PRICE_REFRESH_SECONDS
+            self._refresh_price_only()
+        minutes, seconds = divmod(self._seconds_until_price_refresh, 60)
+        self.next_refresh_label.setText(f"Next price refresh: {minutes}:{seconds:02d}")
 
     def _engage_cooldown(self):
         """
@@ -426,7 +448,7 @@ class MainWindow(QMainWindow):
     def _on_refresh_clicked(self):
         self.refresh_data()
         self._engage_cooldown()
-        self._seconds_until_auto_refresh = AUTO_REFRESH_SECONDS  # manual refresh resets the auto clock too
+        self._seconds_until_price_refresh = PRICE_REFRESH_SECONDS  # manual refresh resets that clock too
 
     def _on_help_clicked(self):
         # Reuse the same window instead of making a new one every
@@ -438,7 +460,61 @@ class MainWindow(QMainWindow):
         self._help_window.activateWindow()
 
     # ------------------------------------------------------------
-    # The actual data fetch + UI update
+    # Live events: called on the MAIN thread (Qt's queued-connection
+    # mechanism guarantees this), so it's safe to touch widgets here
+    # directly -- unlike code running inside P2PoolEventListener
+    # itself, which must never touch the GUI.
+    # ------------------------------------------------------------
+    def _on_p2pool_event(self, event: dict):
+        # apply_event() updates p2pool_state.py's local shadow of the
+        # window (pure calculation, no network calls, see that file's
+        # docstring for how). _render_all_from_state() then just
+        # copies whatever the shadow currently says onto the widgets
+        # -- the exact same rendering code refresh_data() uses after
+        # a full REST bootstrap, so there's only one place that knows
+        # how to draw these numbers, regardless of where they came
+        # from.
+        self.live_state.apply_event(event)
+
+        if event.get("type") == "found_block":
+            # A real Monero block just changed hands -- a rare,
+            # meaningful checkpoint, and a reasonable moment to spend
+            # one light pool_info call refreshing window_miner_count
+            # and total_shares_in_window (the two numbers that only
+            # update on a snapshot, not live -- see p2pool_state.py).
+            # Failure here just leaves those two numbers at their
+            # last known value; nothing else in the render depends on
+            # this succeeding.
+            self._refresh_network_totals_only()
+
+        self._render_all_from_state()
+
+    def _refresh_network_totals_only(self):
+        try:
+            pool_info = self.client.get_pool_info()
+            self.live_state.refresh_network_totals(pool_info)
+        except P2PoolAPIError:
+            pass
+
+    def closeEvent(self, event):
+        # Qt calls this automatically when the window is closing.
+        # Without this, the background thread would still be running
+        # (mid-wait on a WebSocket message) when the app tries to
+        # exit -- Qt prints a warning about a QThread being destroyed
+        # while still running, and shutdown can hang or crash.
+        # stop() asks the loop to exit; wait() blocks HERE (on the
+        # main thread) briefly so we know it actually has before we
+        # let the window finish closing.
+        self.event_listener.stop()
+        self.event_listener.wait(3000)
+        super().closeEvent(event)
+
+    # ------------------------------------------------------------
+    # Bootstrap: the ONLY place that makes the full set of REST
+    # calls now -- runs once at startup, and again if the user clicks
+    # Refresh Now. Everything else redraws from live_state, which
+    # this method seeds via bootstrap() before handing off to the
+    # shared render methods below.
     # ------------------------------------------------------------
     def refresh_data(self):
         try:
@@ -448,38 +524,82 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"Network data fetch failed: {error}")
             return
 
-        self._update_network_panel(pool_info, found_blocks)
-
+        wide_shares = []
+        payouts = []
         if self.wallet_address:
-            self._update_wallet_panel(pool_info, found_blocks)
+            try:
+                self.client.get_miner_info(self.wallet_address)
+                self.wallet_not_found_label.setVisible(False)
+            except P2PoolAPIError:
+                # This wallet has no record on P2Pool at all yet --
+                # distinct from "zero shares right now," which is a
+                # normal live_state reading, not an error.
+                self.wallet_not_found_label.setVisible(True)
 
-        # Price fetch is separate from P2Pool's own API (CoinGecko,
-        # not p2pool.observer), so a failure here shouldn't cancel
-        # the rest of an otherwise-successful refresh -- just leave
-        # the converter showing its last known value.
+            # Wallet-scoped, so small regardless of how big the
+            # network's overall window is -- this is the only
+            # per-share REST call bootstrap makes now. See
+            # p2pool_state.py's docstring for why the network-wide
+            # window dump this used to also fetch got removed
+            # entirely: pool_info already hands back the two numbers
+            # it was for (window_miner_count, total_shares_in_window),
+            # pre-counted, in one much lighter call.
+            day_window = _APPROX_DAY_WINDOW.get(self.network, 8640)
+            try:
+                wide_shares = self.client.get_side_blocks_in_window(
+                    self.wallet_address, window=day_window
+                )
+            except P2PoolAPIError:
+                pass
+            try:
+                payouts = self.client.get_payouts(self.wallet_address, search_limit=5)
+            except P2PoolAPIError:
+                pass
+
+        self.live_state.bootstrap(pool_info, found_blocks, wide_shares, payouts)
+        self._render_all_from_state()
+        self._refresh_price_only()
+
+        now_str = datetime.now().strftime("%Y-%m-%d %I:%M:%S %p")
+        self.statusBar().showMessage(f"Last updated: {now_str}")
+
+    def _refresh_price_only(self):
+        # Separate from P2Pool's own API entirely (CoinGecko, not
+        # p2pool.observer) -- called both from refresh_data() above
+        # and on its own PRICE_REFRESH_SECONDS timer, since this is
+        # the one piece of the dashboard with no event feed to ride
+        # along on.
         try:
             self._xmr_prices = get_xmr_prices()
             self._update_converter_result()
         except PriceAPIError:
             pass
 
-        now_str = datetime.now().strftime("%Y-%m-%d %I:%M:%S %p")
-        self.statusBar().showMessage(f"Last updated: {now_str}")
+    # ------------------------------------------------------------
+    # Rendering: reads ONLY from live_state, never touches the
+    # network. Called after a REST bootstrap above, AND after every
+    # single live event -- same code path either way, so the numbers
+    # can never disagree depending on which source produced them.
+    # ------------------------------------------------------------
+    def _render_all_from_state(self):
+        self._render_network_panel()
+        if self.wallet_address:
+            self._render_wallet_panel()
 
-    def _update_network_panel(self, pool_info, found_blocks):
-        side = pool_info["sidechain"]
-        difficulty = side["difficulty"]
-        block_time = side["block_time"]
-        height = side["height"]
-        window_miners = side["window"]["miners"]
-        window_size = side["window_size"]
+    def _render_network_panel(self):
+        state = self.live_state
 
-        hashrate_hs = calculate_hashrate(difficulty, block_time)
-        self.stat_height.setText(f"{height:,}")
-        self.stat_hashrate.setText(format_hashrate(hashrate_hs))
-        self.stat_window_miners.setText(str(window_miners))
-        self.hashrate_graph.add_point(hashrate_hs)
+        if state.height is not None:
+            self.stat_height.setText(f"{state.height:,}")
 
+        if state.difficulty is not None and state.block_time_seconds:
+            hashrate_hs = calculate_hashrate(state.difficulty, state.block_time_seconds)
+            self.stat_hashrate.setText(format_hashrate(hashrate_hs))
+            self.hashrate_graph.add_point(hashrate_hs)
+
+        self.stat_window_miners.setText(str(state.window_miner_count))
+
+        found_blocks = state.recent_found_blocks
         if found_blocks:
             last_block_ts = found_blocks[0]["main_block"]["timestamp"]
             self._last_monero_block_ts = last_block_ts
@@ -492,9 +612,6 @@ class MainWindow(QMainWindow):
             local_str = datetime.fromtimestamp(last_block_ts).strftime("%Y-%m-%d %I:%M:%S %p")
             self.last_block_time_label.setText(local_str)
 
-            # Average frequency: time span across the found blocks we
-            # have, divided by the number of gaps between them. Needs
-            # at least 2 blocks to compute a gap at all.
             if len(found_blocks) >= 2:
                 oldest_ts = found_blocks[-1]["main_block"]["timestamp"]
                 newest_ts = found_blocks[0]["main_block"]["timestamp"]
@@ -511,77 +628,27 @@ class MainWindow(QMainWindow):
                 self.recent_blocks_table.setItem(row, 0, QTableWidgetItem(local_str))
                 self.recent_blocks_table.setItem(row, 1, QTableWidgetItem(f"{reward_xmr:.6f}"))
 
-        # Payout per share needs total shares in the window -- one
-        # more call, but only made once per refresh (every 300s by
-        # default), which is a light cost for a real number instead
-        # of a placeholder.
-        try:
-            all_window_shares = self.client.get_all_side_blocks_in_window()
-            total_shares = len(all_window_shares)
-            if total_shares and found_blocks:
+            total_shares = state.total_shares_in_window
+            if total_shares:
                 avg_reward_xmr = sum(b["main_block"]["reward"] for b in found_blocks) / len(found_blocks) / 1e12
                 payout_per_share = avg_reward_xmr / total_shares
                 self.stat_payout_per_share.setText(f"{payout_per_share:.8f} XMR")
-        except P2PoolAPIError:
-            # Non-critical field -- if this one call fails, leave it
-            # as "--" rather than failing the whole refresh over it.
-            pass
 
-    def _update_wallet_panel(self, pool_info, found_blocks):
-        side = pool_info["sidechain"]
-        block_time = side["block_time"]
-        window_size = side["window_size"]
-        # A share stays in the PPLNS payout window for exactly this
-        # many seconds after being found -- confirmed against real
-        # data: for Mini, window_size (2160) * block_time (10) works
-        # out to exactly 21,600 seconds, i.e. 6 hours.
-        window_duration_seconds = window_size * block_time
+    def _render_wallet_panel(self):
+        state = self.live_state
 
-        try:
-            miner_info = self.client.get_miner_info(self.wallet_address)
-        except P2PoolAPIError:
-            self.wallet_not_found_label.setVisible(True)
-            return
-
-        self.wallet_not_found_label.setVisible(False)
-
-        last_share_ts = miner_info.get("last_share_timestamp")
+        last_share_ts = state.wallet_last_share_ts
         if last_share_ts:
             local_str = datetime.fromtimestamp(last_share_ts).strftime("%Y-%m-%d %I:%M:%S %p")
             self.stat_wallet_last_share.setText(local_str)
 
-        # "Current Active Shares" -- the API's own live-window count,
-        # authoritative for this number specifically.
-        try:
-            window_shares = self.client.get_side_blocks_in_window(self.wallet_address)
-        except P2PoolAPIError:
-            window_shares = []
-        self.stat_wallet_active_shares.setText(str(len(window_shares)))
+        self.stat_wallet_active_shares.setText(str(state.wallet_active_shares))
+        self.stat_wallet_shares_today.setText(str(state.wallet_shares_last_24h))
 
-        # One wider fetch, reused for both "shares in last 24h" AND
-        # the age/expiration table below -- a share that's already
-        # expired won't appear in the live-window fetch above at all,
-        # so we need this separate, wider lookback to find and show
-        # it as "Expired" rather than have it just vanish.
-        try:
-            day_window = _APPROX_DAY_WINDOW.get(self.network, 8640)
-            wide_shares = self.client.get_side_blocks_in_window(self.wallet_address, window=day_window)
-        except P2PoolAPIError:
-            wide_shares = []
-
-        cutoff = time.time() - 86400
-        shares_today = [s for s in wide_shares if s.get("timestamp", 0) >= cutoff]
-        self.stat_wallet_shares_today.setText(str(len(shares_today)))
-
-        # Share age / expiration table -- the 3 most recent shares,
-        # shown whether still active or already expired. wide_shares
-        # comes back newest-first (matches found_blocks' ordering,
-        # confirmed against the API docs' example responses).
+        share_age_rows = state.wallet_share_age_rows(3)
         for row in range(3):
-            if row < len(wide_shares):
-                share = wide_shares[row]
-                found_ts = share["timestamp"]
-                expires_at = found_ts + window_duration_seconds
+            if row < len(share_age_rows):
+                found_ts, expires_at = share_age_rows[row]
                 remaining_seconds = expires_at - time.time()
                 found_str = datetime.fromtimestamp(found_ts).strftime("%m-%d %I:%M %p")
                 expires_str = "Expired" if remaining_seconds <= 0 else seconds_to_friendly_duration(remaining_seconds)
@@ -593,15 +660,7 @@ class MainWindow(QMainWindow):
                 self.share_age_table.setItem(row, 1, QTableWidgetItem("--"))
                 self._share_expiry_data[row] = None
 
-        # Recent Deposits: actual Monero received by this wallet from
-        # blocks P2Pool has found. Non-critical -- if this call fails
-        # (or the wallet just doesn't have 5 payouts yet), we fall
-        # back to "--" per row rather than failing the whole refresh.
-        try:
-            payouts = self.client.get_payouts(self.wallet_address, search_limit=5)
-        except P2PoolAPIError:
-            payouts = []
-
+        payouts = state.wallet_recent_payouts
         for row in range(5):
             if row < len(payouts):
                 payout = payouts[row]
@@ -616,17 +675,10 @@ class MainWindow(QMainWindow):
                 self.payout_table.setItem(row, 1, QTableWidgetItem("--"))
                 self._payout_found_data[row] = None
 
-        # Estimated window reward: wallet's share COUNT divided by
-        # total shares in the window, times the average recent block
-        # reward. This is an approximation -- real PPLNS payouts are
-        # weighted by share difficulty, not raw count. Labeled as an
-        # estimate in the tooltip so it isn't mistaken for exact.
-        try:
-            all_window_shares = self.client.get_all_side_blocks_in_window()
-            total_shares = len(all_window_shares)
-            if total_shares and found_blocks:
-                avg_reward_xmr = sum(b["main_block"]["reward"] for b in found_blocks) / len(found_blocks) / 1e12
-                estimated_reward = (len(window_shares) / total_shares) * avg_reward_xmr
-                self.stat_wallet_est_reward.setText(f"{estimated_reward:.6f} XMR")
-        except P2PoolAPIError:
-            pass
+        total_shares = state.total_shares_in_window
+        found_blocks = state.recent_found_blocks
+        if total_shares and found_blocks:
+            avg_reward_xmr = sum(b["main_block"]["reward"] for b in found_blocks) / len(found_blocks) / 1e12
+            estimated_reward = (state.wallet_active_shares / total_shares) * avg_reward_xmr
+            self.stat_wallet_est_reward.setText(f"{estimated_reward:.6f} XMR")
+

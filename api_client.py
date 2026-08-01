@@ -42,11 +42,11 @@ _BASE_URLS = {
     Network.NANO: "https://nano.p2pool.observer/api",
 }
 
-# Same browser-identifying header we used in test_connection.py.
+# Not the same browser-identifying header we used in test_connection.py.
 _HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        "Kanada/Humanspiral Custom Dashboard Client"
+        "https://github.com/kanadathegreat/P2Pool-Observer-Dashboard/tree/main"
     )
 }
 
@@ -157,13 +157,29 @@ class P2PoolClient:
 
     def get_pool_info(self) -> dict:
         """
-        General P2Pool + Monero network status. This is the endpoint
-        the dashboard polls every 300 seconds for most of the
-        "Network" panel's numbers.
+        General P2Pool + Monero network status. Called once at
+        startup (and again on manual refresh) to bootstrap
+        p2pool_state.py's local live-state -- most of the "Network"
+        panel updates from WebSocket events after that, not from
+        repeated calls to this.
 
-        Remember: fields like block_time and difficulty live INSIDE
-        the "sidechain" key, not at the top level -- see the note in
-        parse_pool_info() below.
+        Field nesting, confirmed against a real response (this
+        wasn't obvious from the field names alone -- worth writing
+        down exactly, since guessing wrong here fails silently, not
+        with an error):
+            pool_info["sidechain"]["consensus"]["block_time"]
+            pool_info["sidechain"]["consensus"]["pplns_window"]
+            pool_info["sidechain"]["last_block"]["side_height"]
+            pool_info["sidechain"]["last_block"]["difficulty"]
+            pool_info["sidechain"]["window"]["miners"]   # pre-counted!
+            pool_info["sidechain"]["window"]["blocks"]   # pre-counted!
+
+        Those last two matter beyond just "where do I find them": the
+        server has ALREADY counted "how many miners/shares are in the
+        window" for you here. Don't re-derive them by fetching every
+        individual share and counting client-side (see
+        get_all_side_blocks_in_window()'s docstring below) -- that
+        does the server's own work over again for the same answer.
         """
         return self._get("/pool_info", debug_name="pool_info")
 
@@ -213,8 +229,21 @@ class P2PoolClient:
         """
         Same idea as get_side_blocks_in_window(), but network-wide --
         every miner's shares in the window, not just one wallet's.
-        We use the LENGTH of this list as "total shares in the
-        window" when estimating a wallet's proportional payout.
+
+        NOT CURRENTLY CALLED by the dashboard, on purpose: this
+        endpoint means the server enumerates every share for every
+        miner in the window, which the admin flagged as heavy on his
+        end. get_pool_info()'s response already contains the two
+        numbers this dashboard actually needed from that data --
+        sidechain.window.miners and sidechain.window.blocks -- pre-
+        counted, in one much lighter call. See that method's
+        docstring for the exact field paths.
+
+        Left in place (rather than deleted) since it's still a valid,
+        documented endpoint -- just not the right tool for what this
+        dashboard needs. Kept for any future feature that genuinely
+        needs the raw, per-share, network-wide list itself, not just
+        the two summary counts.
         """
         params = {}
         if window is not None:

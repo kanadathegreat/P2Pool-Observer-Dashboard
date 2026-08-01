@@ -116,16 +116,29 @@ remaining rows show "--".</p>
 
 <h2>XMR Price Converter (bottom bar)</h2>
 <p>Type any amount of XMR (numbers and a decimal point only) to see
-its converted value in USD, GBP, or EUR. Prices come from CoinGecko
-and refresh on the same schedule as the rest of the dashboard. Your
-chosen currency is remembered for next time you open the program.</p>
+its converted value in USD, GBP, or EUR. Prices come from CoinGecko --
+a separate service from P2Pool itself, with its own refresh schedule,
+described under "Refresh Behavior" below. Your chosen currency is
+remembered for next time you open the program.</p>
 
 <h2>Refresh Behavior</h2>
-<p>The dashboard automatically refreshes every 5 minutes (300
-seconds) -- the countdown to the next refresh is shown near the
-Refresh button. You can also click "Refresh Now" to update early,
-which then goes on a 30-second cooldown to avoid overloading the
-API.</p>
+<p>Most of the numbers on this dashboard update live, the moment
+something happens on the P2Pool network -- there's no timer to wait
+for and nothing to click. This covers P2Pool Height, P2Pool Hashrate,
+the Last 3 Blocks Found table, and everything in the Wallet Panel.</p>
+<p>"Window Miners," "Current Payout Per Share," and "Estimated Window
+Reward" are the exceptions -- they update whenever a new Monero block
+is found, or when you click "Refresh Now," rather than instantly with
+every small change. In practice this usually means they're accurate
+within the last few minutes to a couple of hours, depending on how
+often blocks are being found.</p>
+<p>The XMR Price Converter is separate from all of this -- it isn't
+part of P2Pool at all, so it checks CoinGecko for new prices every 5
+minutes on its own schedule, shown as a countdown near the Refresh
+button.</p>
+<p>Click "Refresh Now" anytime to re-check everything from scratch.
+It's limited to once every 30 seconds, to avoid putting unnecessary
+load on the server.</p>
 
 <h2>Startup Screen</h2>
 <p>When the program opens, it asks which network to use (Normal,
@@ -134,4 +147,38 @@ wrong network means a wallet that's actually mining elsewhere won't
 show any data. Previously used wallets are saved in a dropdown for
 next time -- unless you check "Don't remember this wallet," or use the
 "Purge Saved Wallets" button to clear all of them at once.</p>
+
+<h2>License</h2>
+<p><strong>The Commons Clause Condition to License Work Version 1.0</strong></p>
+
+<h3>1. License Terms: The MIT License (MIT)</h3>
+<p>Copyright (c) 2026</p>
+<p>Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:</p>
+<p>The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.</p>
+
+<h3>2. Commons Clause Condition</h3>
+<p>Without limiting other conditions in the License, the grant of rights under
+the License will not include, and the License does not grant to you, the right
+to Sell the Software.</p>
+<p>For purposes of the foregoing, "Sell" means practicing any or all of the rights
+granted to you under the License to provide to third parties, for a fee or
+other consideration (including without limitation the fee for hosting or
+hosting-related services, or fee for support or maintenance services), a product
+or service whose value derives entirely or substantially from the functionality
+of the Software.</p>
+
+<h3>3. Disclaimer</h3>
+<p>THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.</p>
 """

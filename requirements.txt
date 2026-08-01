@@ -5,3 +5,6 @@ requests==2.32.3
 # GUI Test folder, kept identical on purpose so we know it behaves
 # the same way here.
 PySide6==6.7.2
+
+#Server admins prefered method of sharing data.
+websockets
