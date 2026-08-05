@@ -300,6 +300,33 @@ class P2PoolClient:
 # these functions' job is "do math on data we already have." Mixing
 # the two would make both harder to test.
 
+# Monero (and every P2Pool payout/reward number) is counted internally
+# in "atomic units" -- the smallest possible slice, the same way a US
+# bank actually counts your balance in cents behind the scenes even
+# though the screen shows dollars. 1 XMR = 1,000,000,000,000 atomic
+# units (10^12, twelve zeros). CONFIRMED against a real pool_info
+# debug file: mainchain.base_reward came back as 600000000000, which
+# is exactly 0.6 XMR -- the block reward you'd expect for a Monero
+# block right now, so the conversion checks out.
+#
+# Every reward-shaped number the API hands back (base_reward,
+# coinbase_reward, payouts, etc) is in these atomic units. Anywhere
+# you're about to show a person a coin amount, run it through this
+# first -- showing them "600000000000" instead of "0.6" would be a
+# very confusing dashboard.
+ATOMIC_UNITS_PER_XMR = 1_000_000_000_000
+
+
+def atomic_to_xmr(atomic_amount) -> float:
+    """
+    Converts a raw atomic-unit amount (what the API always gives you)
+    into the normal XMR number a person would recognize.
+
+        atomic_to_xmr(600000000000) -> 0.6
+    """
+    return atomic_amount / ATOMIC_UNITS_PER_XMR
+
+
 def calculate_hashrate(difficulty: float, block_time_seconds: float) -> float:
     """
     Returns hashrate in H/s (hashes per second).

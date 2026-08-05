@@ -98,6 +98,21 @@ class P2PoolLiveState:
         self.window_miner_count = 0
         self.total_shares_in_window = 0
 
+        # --- PPLNS "weight" tracking ---
+        # Added after confirming (against real debug JSON, not a
+        # guess) that "my share count / total share count" is NOT how
+        # P2Pool actually decides payouts. The real currency is
+        # "weight": each share's difficulty, adjusted for uncles.
+        # See _share_weight() below for the exact math and what's
+        # been confirmed vs. not.
+        #
+        # All three of these are SNAPSHOT values, same cadence as
+        # window_miner_count/total_shares_in_window right above --
+        # only bootstrap() and refresh_network_totals() touch them.
+        self.pool_window_weight = 0     # sidechain.window.weight
+        self.uncle_penalty_percent = 0  # sidechain.uncle_penalty (e.g. 20)
+        self.base_reward_atomic = 0     # mainchain.base_reward
+
         # Our wallet's own shares, newest first. This is the only
         # per-share list this file keeps -- small by construction,
         # since the REST call that seeds it is already wallet-scoped.
@@ -137,6 +152,17 @@ class P2PoolLiveState:
         window = side["window"]
         self.window_miner_count = window["miners"]
         self.total_shares_in_window = window["blocks"]
+        self.pool_window_weight = window["weight"]
+
+        # NOTE: "uncle_penalty" lives directly under sidechain, not
+        # under sidechain.window. "base_reward" lives under
+        # "mainchain" -- CONFIRMED spelled with no underscore, one
+        # word, against a real pool_info debug file. It's an easy typo
+        # to make (main_chain reads more natural) and it fails
+        # silently -- a wrong key just gives you a KeyError, or worse,
+        # a 0 that quietly makes every reward estimate show as 0.
+        self.uncle_penalty_percent = side["uncle_penalty"]
+        self.base_reward_atomic = pool_info["mainchain"]["base_reward"]
 
         self._wallet_shares = list(wallet_recent_shares)
         self.recent_found_blocks = list(found_blocks)
@@ -144,11 +170,12 @@ class P2PoolLiveState:
 
     def refresh_network_totals(self, pool_info):
         """
-        Lighter cousin of bootstrap() -- updates ONLY the two
-        network-wide snapshot numbers (window_miner_count,
-        total_shares_in_window) from a fresh pool_info call. Doesn't
-        touch height/difficulty (already kept current by every
-        side_block/found_block event) or any wallet-specific data.
+        Lighter cousin of bootstrap() -- updates ONLY the network-wide
+        snapshot numbers (window_miner_count, total_shares_in_window,
+        and now the three weight-related fields alongside them) from
+        a fresh pool_info call. Doesn't touch height/difficulty
+        (already kept current by every side_block/found_block event)
+        or any wallet-specific data.
 
         Meant to be called on some occasional trigger -- see
         main_window.py's _on_p2pool_event(), which calls this
@@ -156,12 +183,22 @@ class P2PoolLiveState:
         being found is a naturally infrequent, meaningful checkpoint
         -- far rarer than side_block events -- which makes it a
         reasonable moment to spend one light pool_info call refreshing
-        these two numbers, without needing a timer or the heavy
-        per-share call this file was rewritten to avoid.
+        these numbers, without needing a timer or the heavy per-share
+        call this file was rewritten to avoid.
+
+        Refreshing pool_window_weight and base_reward_atomic here
+        matters more than it might look: base_reward shifts a little
+        with every Monero block (transaction fees change it slightly),
+        and pool_window_weight shifts as old shares age out of the
+        window and new ones come in. A found_block event is exactly
+        the moment both of those are most likely to have moved.
         """
         window = pool_info["sidechain"]["window"]
         self.window_miner_count = window["miners"]
         self.total_shares_in_window = window["blocks"]
+        self.pool_window_weight = window["weight"]
+        self.uncle_penalty_percent = pool_info["sidechain"]["uncle_penalty"]
+        self.base_reward_atomic = pool_info["mainchain"]["base_reward"]
 
     # ------------------------------------------------------------
     # Event handling -- call for every event the listener emits.
@@ -247,6 +284,59 @@ class P2PoolLiveState:
         cutoff = self.height - self.window_size_blocks
         return [s for s in self._wallet_shares if s.get("side_height", -1) > cutoff]
 
+    def _share_weight(self, share: dict) -> float:
+        """
+        Works out ONE share's real PPLNS weight -- the number that
+        actually decides its slice of a payout. NOT the same thing as
+        the share's raw "difficulty" field, though for most shares
+        (ones that didn't include an uncle) they happen to be equal.
+
+        CONFIRMED against a real side_blocks_in_window debug file: a
+        share dict that included one or more uncles carries an
+        "uncles" list, and each entry in that list is its own little
+        dict with its own "difficulty". A share that included NO
+        uncles just doesn't have the "uncles" key at all (it's not an
+        empty list -- it's flat-out missing), which is why we read it
+        with .get("uncles", []) below instead of ["uncles"].
+
+        The math itself, confirmed against api.go's PPLNS weight
+        calculation and P2Pool's own uncle-penalty docs:
+          - A share that included uncles gets its OWN full difficulty,
+            PLUS a bonus worth uncle_penalty_percent of each included
+            uncle's difficulty. (On Mini and Main, that's 20% as of
+            writing -- but we always read the live value from
+            pool_info instead of hardcoding 20, in case it's ever
+            different on Nano, or changes in the future.)
+          - The other side of that penalty: an uncle share only
+            counts for the REMAINING (100 - uncle_penalty_percent)
+            percent of its own difficulty, since some of its value
+            went to whichever share included it as a bonus. Nothing
+            is created or destroyed overall -- it's a transfer, not a
+            loss.
+
+        ONE THING NOT YET CONFIRMED WITH REAL DATA: whether one of
+        YOUR OWN shares that became somebody else's uncle would even
+        show up as its own top-level entry when you call
+        side_blocks_in_window for your address, and if it did, which
+        field would mark it as an uncle share rather than a normal
+        one. Every real share pulled so far (19 of them, in the debug
+        file this was built against) was a normal share, so that
+        second bullet above has never actually been exercised against
+        real data -- only reasoned out from the docs and api.go. If
+        you ever spot a share in a fresh debug file that looks like
+        it might be an uncle, that's the moment to come back to this
+        function and confirm the second bullet properly.
+        """
+        penalty_fraction = self.uncle_penalty_percent / 100
+
+        # The bonus this share earns for each uncle IT included.
+        uncle_bonus = sum(
+            uncle.get("difficulty", 0) * penalty_fraction
+            for uncle in share.get("uncles", [])
+        )
+
+        return share.get("difficulty", 0) + uncle_bonus
+
     # ------------------------------------------------------------
     # Derived values -- read by main_window.py every time it wants to
     # redraw. All pure calculation on data already in memory; no
@@ -257,6 +347,53 @@ class P2PoolLiveState:
         if not self.wallet_address:
             return 0
         return len(self._shares_still_in_window())
+
+    @property
+    def wallet_window_weight(self):
+        """
+        Sum of _share_weight() across every one of this wallet's
+        shares still counted in the current PPLNS window. This is
+        the correct numerator for "how much of the pool is mine" --
+        NOT wallet_active_shares (a plain count), which treats a big
+        share and a small share as worth the same amount.
+        """
+        return sum(self._share_weight(s) for s in self._shares_still_in_window())
+
+    @property
+    def wallet_pool_share_percent(self):
+        """
+        What percentage of the current PPLNS window belongs to this
+        wallet, by weight. This is the number p2pool.observer's own
+        miner page calls "Pool Share %" -- and it's a weight-based
+        fraction, not a share-count-based one, which is exactly the
+        distinction that started this whole investigation.
+
+        Guards against dividing by zero for the brief moment right
+        after startup, before bootstrap() has run and
+        pool_window_weight is still its initial 0.
+        """
+        if not self.pool_window_weight:
+            return 0.0
+        return self.wallet_window_weight / self.pool_window_weight * 100
+
+    @property
+    def wallet_estimated_window_reward_atomic(self):
+        """
+        This wallet's estimated slice of the reward, IF the pool
+        found a Monero block right now, in atomic units -- run it
+        through api_client.atomic_to_xmr() before putting it on
+        screen.
+
+        Read the word "estimated" seriously: this is a snapshot, not
+        a promise. Both pieces it's built from keep moving --
+        base_reward_atomic shifts slightly with transaction fees on
+        whatever block gets found, and the window's contents (and
+        therefore wallet_pool_share_percent) shift as old shares age
+        out and new ones come in. Treat this as "about this much,
+        roughly, right now" -- the same way p2pool.observer's own
+        "Estimated Window Reward" field behaves.
+        """
+        return self.wallet_pool_share_percent / 100 * self.base_reward_atomic
 
     @property
     def wallet_shares_last_24h(self):

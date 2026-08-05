@@ -76,7 +76,7 @@ fi
 # dependency, etc), this "if" catches that and shows the popup
 # instead of just closing silently.
 if ! "$PYTHON_BIN" main.py; then
-    show_error "P2Pool Observer Dashboard failed to start.
+    show_error "P2Pool Observer Dashboard failed to start or close correctly.
 
 Try running it from a terminal in this folder for more detail:
   venv/bin/python3 main.py"

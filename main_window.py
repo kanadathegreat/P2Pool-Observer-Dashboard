@@ -33,6 +33,7 @@ from price_client import get_xmr_prices, PriceAPIError
 from api_client import (
     Network, P2PoolClient, P2PoolAPIError,
     calculate_hashrate, format_hashrate, seconds_to_friendly_duration,
+    atomic_to_xmr,
 )
 from event_listener import P2PoolEventListener
 from p2pool_state import P2PoolLiveState
@@ -318,7 +319,7 @@ class MainWindow(QMainWindow):
         self.converter_result_label.setText(f"{symbol}{converted:,.2f}")
 
     def _build_network_panel(self):
-        group = QGroupBox(f"P2Pool Network — {_NETWORK_LABELS[self.network]}")
+        group = QGroupBox(f"P2Pool Network: {_NETWORK_LABELS[self.network]}")
         layout = QVBoxLayout(group)
         grid = QGridLayout()
         grid.setColumnStretch(1, 1)
@@ -333,8 +334,13 @@ class MainWindow(QMainWindow):
             "Average time between blocks found, based on the last few found.")
         self.stat_window_miners = make_stat_row(grid, 4, "Window Miners",
             "Number of distinct miners with shares in the current payout window.")
-        self.stat_payout_per_share = make_stat_row(grid, 5, "Current Payout Per Share",
-            "Rough estimate of what one share is worth right now, in XMR.")
+        self.stat_payout_per_share = make_stat_row(grid, 5, "Average Share Value",
+            "The pool-wide AVERAGE reward per share right now (total expected "
+            "reward divided by share count). A genuine average, mathematically "
+            "identical to weighting by each share's real difficulty and summing -- "
+            "unlike a per-WALLET estimate, an average across the whole pool doesn't "
+            "need individual share weights to be correct. Any one share can still "
+            "be worth more or less than this, depending on its own difficulty.")
         layout.addLayout(grid)
 
         self.last_block_time_label = QLabel("")
@@ -354,8 +360,8 @@ class MainWindow(QMainWindow):
         return group
 
     def _build_wallet_panel(self):
-        title = "Wallet — none selected" if not self.wallet_address else \
-            f"Wallet — {self.wallet_address[:10]}...{self.wallet_address[-6:]}"
+        title = "Wallet: none selected" if not self.wallet_address else \
+            f"Wallet: {self.wallet_address[:10]}...{self.wallet_address[-6:]}"
         self.wallet_group = QGroupBox(title)
         layout = QVBoxLayout(self.wallet_group)
 
@@ -377,8 +383,13 @@ class MainWindow(QMainWindow):
         self.stat_wallet_shares_today = make_stat_row(grid, 2, "Shares (Last 24h)",
             "Shares this wallet has found in roughly the last 24 hours.")
         self.stat_wallet_est_reward = make_stat_row(grid, 3, "Estimated Window Reward",
-            "Rough estimate of this wallet's payout if a block were found right now. "
-            "Approximate: based on share COUNT, not actual PPLNS weighting.")
+            "Estimate of this wallet's payout if a block were found right now, based "
+            "on this wallet's real PPLNS weight (share difficulty, with uncle "
+            "adjustments) as a fraction of the whole window's weight -- the same "
+            "method p2pool.observer itself uses. Still an estimate: both the window's "
+            "contents and the block reward shift constantly.")
+        self.stat_wallet_pool_share = make_stat_row(grid, 4, "Pool Share %",
+            "This wallet's percentage of the current PPLNS window, by weight.")
         layout.addLayout(grid)
 
         share_age_caption = QLabel("Recent Share Age / Expiration")
@@ -561,7 +572,7 @@ class MainWindow(QMainWindow):
         self._refresh_price_only()
 
         now_str = datetime.now().strftime("%Y-%m-%d %I:%M:%S %p")
-        self.statusBar().showMessage(f"Last updated: {now_str}")
+        self.statusBar().showMessage(f"Last Full Refresh: {now_str}")
 
     def _refresh_price_only(self):
         # Separate from P2Pool's own API entirely (CoinGecko, not
@@ -630,6 +641,21 @@ class MainWindow(QMainWindow):
 
             total_shares = state.total_shares_in_window
             if total_shares:
+                # NOTE: this is a POOL-WIDE average, not a per-wallet
+                # estimate -- and unlike the per-wallet stat above (see
+                # wallet_estimated_window_reward_atomic in
+                # p2pool_state.py), this one does NOT need to switch to
+                # weight-based math. Checked algebraically: average
+                # reward / share count is always identical to (average
+                # reward / total weight) * (average weight per share),
+                # regardless of how unevenly weight is spread across
+                # shares -- that's just how averages work. Confirmed
+                # against real debug data too: both methods produced
+                # the exact same result to the last decimal place.
+                # Only the wording changed here (see the tooltip
+                # above), since "what one share is worth" reads like a
+                # promise about any single share, when it's really an
+                # average one specific share can land above or below.
                 avg_reward_xmr = sum(b["main_block"]["reward"] for b in found_blocks) / len(found_blocks) / 1e12
                 payout_per_share = avg_reward_xmr / total_shares
                 self.stat_payout_per_share.setText(f"{payout_per_share:.8f} XMR")
@@ -675,10 +701,19 @@ class MainWindow(QMainWindow):
                 self.payout_table.setItem(row, 1, QTableWidgetItem("--"))
                 self._payout_found_data[row] = None
 
-        total_shares = state.total_shares_in_window
-        found_blocks = state.recent_found_blocks
-        if total_shares and found_blocks:
-            avg_reward_xmr = sum(b["main_block"]["reward"] for b in found_blocks) / len(found_blocks) / 1e12
-            estimated_reward = (state.wallet_active_shares / total_shares) * avg_reward_xmr
-            self.stat_wallet_est_reward.setText(f"{estimated_reward:.6f} XMR")
+        # Weight-based estimate -- replaces the old share-COUNT-based
+        # version (wallet_active_shares / total_shares_in_window),
+        # which treated every share as worth the same amount. It
+        # isn't: a share's difficulty varies, and uncle shares are
+        # worth less than a regular share. See p2pool_state.py's
+        # _share_weight() for exactly how that's accounted for.
+        #
+        # wallet_estimated_window_reward_atomic already does the full
+        # calculation (this wallet's weight / the window's total
+        # weight, times the current base block reward) -- all we do
+        # here is convert its atomic-unit result into XMR for
+        # display, same as every other reward number on this screen.
+        estimated_reward = atomic_to_xmr(state.wallet_estimated_window_reward_atomic)
+        self.stat_wallet_est_reward.setText(f"{estimated_reward:.6f} XMR")
+        self.stat_wallet_pool_share.setText(f"{state.wallet_pool_share_percent:.3f}%")
 

@@ -50,7 +50,7 @@ DISABLED_TEXT = "#6f6f6f"
 # Dashboard" -- kept as a separate variable so you can pick something
 # more distinctive for headings without changing all the body text.
 FONT_FAMILY_BODY = "Ubuntu"
-FONT_FAMILY_HEADING = "Ubuntu"
+FONT_FAMILY_HEADING = "URW Gothic"
 
 
 # --- The actual stylesheet ----------------------------------------
@@ -98,7 +98,7 @@ QLabel[subtext="true"] {{
 /* A label with the "heading" property set -- used for section titles */
 QLabel[heading="true"] {{
     color: {ORANGE};
-    font-size: 15px;
+    font-size: 20px;
     font-weight: bold;
     font-family: "{FONT_FAMILY_HEADING}";
 }}
@@ -118,7 +118,7 @@ QGroupBox {{
 /* The little title that sits on a QGroupBox's top border */
 QGroupBox::title {{
     subcontrol-origin: margin;
-    left: 10px;
+    left: 15px;
     padding: 0 6px;
     color: {ORANGE};
     font-family: "{FONT_FAMILY_HEADING}";
